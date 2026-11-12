@@ -25,6 +25,7 @@ if an exception is raised):
         print(motor.position())
 """
 
+import cmd
 import re                      # top of file
 
 _IP_REPLY_RE = re.compile(rb"IP=([0-9A-Fa-f]{1,8})\r")
@@ -114,18 +115,6 @@ class Motor:
                 f"limit (+{LIMIT_MARGIN_DEG} deg margin) -- bad reading or motor out of "
                 f"range; refusing to move.")
 
-    def _send(self, cmd, delay=0.02):
-        # Last line of defence: no single DI may exceed a full -max..+max swing,
-        # whatever the caller computed.
-        if cmd.startswith("DI"):
-            di = int(cmd[2:])
-            if abs(di) > self._max_di_counts:
-                raise ValueError(
-                    f"Refusing {cmd}: {abs(di) / self.counts_per_deg:.1f} deg move exceeds "
-                    f"the {2 * self.max_travel_deg:.0f} deg maximum single move")
-        with self._serial_lock:
-            ...   # rest unchanged
-
     # ----------------------------------------------------------------
     # Lifecycle: start() / stop()
     # ----------------------------------------------------------------
@@ -168,16 +157,21 @@ class Motor:
     # ----------------------------------------------------------------
     # Low-level serial helpers
     # ----------------------------------------------------------------
-
     def _send(self, cmd, delay=0.02):
-        """Write a command to the drive. Always goes through _serial_lock
-        so it can never land on the wire in the middle of a background
-        IP poll."""
-        with self._serial_lock:
-            print(f">> {cmd}")
-            self._ser.write((cmd + "\r").encode())
-            if cmd != "IP" and delay > 0:
-                time.sleep(delay)
+        """Write a command to the drive. Always goes through _serial_lock 
+        so it can never land on the wire in the middle of a background IP poll."""
+    if cmd.startswith("DI"):
+        di = int(cmd[2:])
+        if abs(di) > self._max_di_counts:
+            raise ValueError(
+                f"Refusing {cmd}: {abs(di) / self.counts_per_deg:.1f} deg move exceeds "
+                f"the {2 * self.max_travel_deg:.0f} deg maximum single move")
+    with self._serial_lock:
+        print(f">> {cmd}")
+        self._ser.write((cmd + "\r").encode())
+        if cmd != "IP" and delay > 0:
+            time.sleep(delay)
+
 
     def _send_and_read(self, cmd, delay=0.02):
         """Like _send, but also reads and returns whatever the drive

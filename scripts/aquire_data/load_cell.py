@@ -1,44 +1,21 @@
 """
 load_cell.py
 
-Adapted from fun_read_load.py (Girgus Sedky / Keller Morrison) to add a
-duration-bounded, synchronized-start capture function that main.py's
-sweep pipeline can run in a background thread alongside the accelerometer
-capture (collect_accel_for_duration in main.py).
+NI-DAQ load-cell acquisition for the sweep pipeline (main.py).
 
-Original standalone helpers (acquire_load, calibrate_load, OUTPUT_LABELS)
-are unchanged and still usable on their own:
+Load cell: 400 N, calibrated in 2019. Six strain-gauge channels AI0..AI5
+(differential) -> [Fx, Fy, Fz, Mx, My, Mz] via CALIBRATION_MATRIX.
 
-    from load_cell import acquire_load, calibrate_load, OUTPUT_LABELS
-    data, t = acquire_load("Dev11", 1000.0, 10.0)
-    F = calibrate_load(data)
+    F = CALIBRATION_MATRIX @ V  -  F0
 
-New for the sweep pipeline:
+F0 (the tare) is NOT stored here: the old ZERO_OFFSET belonged to the old
+cell. Either pass a tare to collect_load_for_duration (measured with
+measure_tare() at the start of a run) or leave it None (no tare; means are
+then raw calibrated values, variances are unaffected).
 
-    from load_cell import collect_load_for_duration
-    n_samples, t_start = collect_load_for_duration(
-        "Dev11", 1000.0, duration_s=5.0, csv_path="angle_+05.00deg_load.csv",
-        start_event=start_gate,
-    )
-
-`start_event` is anything with a no-arg `.wait()` method -- a
-threading.Event or a threading.Barrier both work. Passing the SAME
-threading.Barrier(2) object to this function and to
-main.collect_accel_for_duration lets both captures release at (as close
-as possible to) the same instant: each side finishes its own
-setup/arming, calls start_gate.wait(), and both are released together as
-soon as the second one arrives -- no guessed sleep needed in the caller.
-
-Timing note (software sync, ms-level jitter -- see project notes):
-    t_start (a time.perf_counter() value) is captured immediately after
-    the DAQ task is started (right after the shared start_event/barrier
-    releases). Every sample's "time" column in the output CSV is
-    relative to that same t_start. main.py logs both this load-cell
-    t_start and the accelerometer's t_start to coordinate_frame_angles.csv
-    so the two streams can be aligned precisely in post-processing --
-    the two t_start values typically differ by well under the polling
-    interval, but recording both keeps that offset explicit instead of
-    assumed.
+!! Check the units your calibration expects. If the matrix was derived for
+!! bridge output in mV/V (or volts after amplifier gain) rather than the raw
+!! DAQ volts read here, apply that scale in VOLTS_TO_MATRIX_INPUT below.
 """
 
 import csv
@@ -47,180 +24,115 @@ import time
 import numpy as np
 import nidaqmx
 from nidaqmx.constants import TerminalConfiguration
-from utils.live_variance_plot import loadcell_magnitude_variance   # NEW import at top of file
 
+N_CHANNELS = 6  # AI0 .. AI5, all DIFFERENTIAL
 
-N_CHANNELS = 6  # AI0 through AI5, see column mapping below
-
-# Column order in `data` (AI channel each column comes from):
-#   col 0 = STG0 <- AI0  (SGO1/SGR1)
-#   col 1 = STG1 <- AI1  (SGO2/SGR2)
-#   col 2 = STG2 <- AI2  (SGO3/SGR3)
-#   col 3 = STG3 <- AI3  (SGO4/SGR4)
-#   col 4 = STG4 <- AI4  (SGO5/SGR5)
-#   col 5 = STG5 <- AI5  (SGO6/SGR6)
-# All channels are wired as DIFFERENTIAL inputs.
-
+# 400 N load cell - calibrated in 2019
 CALIBRATION_MATRIX = np.array([
-    [ 0.01441, -0.03561,  0.06162,  3.17245, -0.02691, -3.05961],
-    [ 0.00040, -3.56010,  0.06360,  1.77360,  0.01050,  1.81183],
-    [ 5.19068, -0.13715,  5.18041, -0.21654,  5.31873, -0.02642],
-    [-0.00123, -0.03754,  0.07456,  0.01569, -0.07386,  0.01950],
-    [-0.08462,  0.00250,  0.04108, -0.03531,  0.04421,  0.03225],
-    [ 0.00055, -0.04511, -0.00133, -0.04620, -0.00074, -0.04466],
+    [ 52.497,  0.376, -0.204, -2.305,  0.149,  0.782],
+    [  0.134, 52.278,  0.796,  0.068,  0.677,  1.018],
+    [ -0.444, -3.426, 104.655, 0.150,  0.0335, 4.513],
+    [  0.014,  0.038,  0.011, 10.495,  0.003,  0.101],
+    [ -0.022, -0.277,  0.038, -0.007, 10.586,  0.424],
+    [  0.021,  0.081,  0.044,  0.031, -0.144, 10.510],
 ])
 
-# Static offset correction determined alongside CALIBRATION_MATRIX.
-ZERO_OFFSET = np.array([[-3.161689], [3.691926], [-4.383389],
-                         [0.159664], [0.157204], [-0.014721]])
+# Multiplier from DAQ volts to whatever the matrix expects (1.0 = matrix takes raw volts).
+VOLTS_TO_MATRIX_INPUT = 1.0
 
 OUTPUT_LABELS = ["Fx", "Fy", "Fz", "Mx", "My", "Mz"]
+DAQ_RANGE_V = 10.0
+CLIP_LEVEL = 0.99
 
 
-# --------------------------------------------------
-# Standalone helpers (unchanged behavior from fun_read_load.py)
-# --------------------------------------------------
+def _add_channels(task, device_name):
+    for ch in range(N_CHANNELS):
+        task.ai_channels.add_ai_voltage_chan(
+            f"{device_name}/ai{ch}",
+            terminal_config=TerminalConfiguration.DIFF,
+            min_val=-DAQ_RANGE_V, max_val=DAQ_RANGE_V,
+        )
+
+
+def calibrate_load(data, tare=None):
+    """data: (n_samples, 6) volts. Returns (6, n_samples) [Fx..Mz].
+    tare: optional length-6 array subtracted from the calibrated values."""
+    F = CALIBRATION_MATRIX @ (data.T * VOLTS_TO_MATRIX_INPUT)
+    if tare is not None:
+        F = F - np.asarray(tare, dtype=float).reshape(6, 1)
+    return F
+
+
+def loadcell_magnitude_variance(force_xyz_rows):
+    """Variance of the per-sample force magnitude |F| (rows of Fx, Fy, Fz)."""
+    mags = np.linalg.norm(np.asarray(force_xyz_rows, dtype=float), axis=1)
+    return float(np.var(mags))
 
 
 def acquire_load(device_name, sample_rate, duration_s):
-    """
-    Sets up the DAQ task and reads all 6 channels for duration_s seconds.
-    Returns:
-        data : (n_samples, 6) matrix, one row per sample, columns = AI0..AI5
-        t    : (n_samples,) timestamps in seconds
-    """
-    n_samples = int(round(sample_rate * duration_s))
-
+    """Finite read of all 6 channels. Returns (data (n,6) volts, t (n,))."""
+    n = int(round(sample_rate * duration_s))
     with nidaqmx.Task() as task:
-        for ch in range(N_CHANNELS):
-            task.ai_channels.add_ai_voltage_chan(
-                f"{device_name}/ai{ch}",
-                terminal_config=TerminalConfiguration.DIFF,
-                min_val=-10.0,
-                max_val=10.0,
-            )
-        task.timing.cfg_samp_clk_timing(sample_rate, samps_per_chan=n_samples)
-        raw = task.read(number_of_samples_per_channel=n_samples,
-                         timeout=duration_s + 10.0)
-
-    data = np.array(raw).T  # (n_samples, 6)
-    t = np.arange(n_samples) / sample_rate
-    return data, t
+        _add_channels(task, device_name)
+        task.timing.cfg_samp_clk_timing(sample_rate, samps_per_chan=n)
+        raw = task.read(number_of_samples_per_channel=n, timeout=duration_s + 10.0)
+    return np.array(raw).T, np.arange(n) / sample_rate
 
 
-def calibrate_load(data, debug=False):
+def measure_tare(device_name, sample_rate, duration_s=5.0):
+    """Mean calibrated load with the rig unloaded / fan off. Returns a length-6
+    array (N, N*m) to pass as `tare`. Taring with the blade mounted also removes
+    the blade's static weight from the mean forces."""
+    data, _ = acquire_load(device_name, sample_rate, duration_s)
+    return calibrate_load(data).mean(axis=1)
+
+
+def collect_load_for_duration(device_name, sample_rate, duration_s, csv_path, tare=None):
+    """Capture duration_s seconds, write csv_path, return a dict:
+        n_samples, t_start (perf_counter at DAQ start), variance (Var|F|, N^2),
+        mean (6,), clip_frac (largest fraction of samples near the +-10 V rail).
+    CSV time column is relative to t_start; t_start_perf_counter is in the header
+    (same clock as Motor's encoder log, so encoder angle can be window-averaged).
     """
-    data : (n_samples, 6) matrix of STG voltages.
-    Returns F : (6, n_samples) matrix of [Fx, Fy, Fz, Mx, My, Mz] per sample.
-    """
-    raw = CALIBRATION_MATRIX @ data.T
-    if debug:
-        print("DEBUG pre-correction sample:", raw[:, 0])
-    corrected = raw - ZERO_OFFSET
-    if debug:
-        print("DEBUG post-correction sample:", corrected[:, 0])
-    return corrected
-
-
-# --------------------------------------------------
-# Duration-bounded, synchronized-start capture for the sweep pipeline
-# --------------------------------------------------
-
-
-def collect_load_for_duration(device_name, sample_rate, duration_s, csv_path,
-                               start_event=None):
-    """Capture load-cell data for duration_s seconds and write it to
-    csv_path, releasing (starting the DAQ clock) at the same instant as a
-    concurrent accelerometer capture when start_event is shared between
-    the two.
-
-    start_event: optional object with a no-arg .wait() method (a
-    threading.Event or threading.Barrier). All DAQ task setup/config
-    happens BEFORE this call so it's fast; the task is only actually
-    started (task.start()) after start_event.wait() returns, and t_start
-    is stamped immediately after that -- mirroring
-    main.collect_accel_for_duration's arm-then-wait-then-go pattern so
-    both captures' zero references land as close together as possible.
-
-    Returns (n_samples, t_start) where t_start is the time.perf_counter()
-    value at which DAQ acquisition actually began (also written into the
-    CSV header for reference).
-    """
-    n_samples = int(round(sample_rate * duration_s))
-
+    n = int(round(sample_rate * duration_s))
     with nidaqmx.Task() as task:
-        for ch in range(N_CHANNELS):
-            task.ai_channels.add_ai_voltage_chan(
-                f"{device_name}/ai{ch}",
-                terminal_config=TerminalConfiguration.DIFF,
-                min_val=-10.0,
-                max_val=10.0,
-            )
-        task.timing.cfg_samp_clk_timing(sample_rate, samps_per_chan=n_samples)
-
-        if start_event is not None:
-            start_event.wait()
-
+        _add_channels(task, device_name)
+        task.timing.cfg_samp_clk_timing(sample_rate, samps_per_chan=n)
         task.start()
         t_start = time.perf_counter()
-
-        raw = task.read(number_of_samples_per_channel=n_samples,
-                         timeout=duration_s + 10.0)
+        raw = task.read(number_of_samples_per_channel=n, timeout=duration_s + 10.0)
         task.stop()
 
-    data = np.array(raw).T  # (n_samples, 6)
-    F = calibrate_load(data)  # (6, n_samples)
-    t = np.arange(n_samples) / sample_rate  # relative to t_start
+    data = np.array(raw).T            # (n, 6) volts
+    F = calibrate_load(data, tare)    # (6, n)
+    t = np.arange(n) / sample_rate
 
     with open(csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        f.write(f"# NI load cell, {sample_rate:.1f} Hz, "
-                 f"t_start_perf_counter={t_start:.6f}\n")
-        writer.writerow(
-            ["sample", "time"]
-            + [f"stg{i}" for i in range(N_CHANNELS)]
-            + OUTPUT_LABELS
-        )
-        for i in range(n_samples):
-            writer.writerow(
-                [i, f"{t[i]:.6f}"] + data[i, :].tolist() + F[:, i].tolist()
-            )
+        f.write(f"# NI load cell (400 N), {sample_rate:.1f} Hz, t_start_perf_counter={t_start:.6f}\n")
+        w = csv.writer(f)
+        w.writerow(["sample", "time"] + [f"stg{i}" for i in range(N_CHANNELS)] + OUTPUT_LABELS)
+        for i in range(n):
+            w.writerow([i, f"{t[i]:.6f}"] + data[i].tolist() + F[:, i].tolist())
 
     elapsed = time.perf_counter() - t_start
-    rate = n_samples / elapsed if elapsed > 0 else 0
-    print(f"  Load cell: captured {n_samples} samples in {elapsed:.2f}s "
-          f"({rate:.0f}/s)")
-
-    force_xyz = F[:3, :].T  # (n_samples, 3) -- Fx, Fy, Fz per sample     # NEW
-    load_var = loadcell_magnitude_variance(force_xyz) if n_samples > 0 else 0.0  # NEW
-
-    return n_samples, t_start, load_var      
-
-
-# --------------------------------------------------
-# CLI entry point (unchanged, for standalone testing off the DAQ)
-# --------------------------------------------------
+    print(f"  Load cell: captured {n} samples in {elapsed:.2f}s ({n / elapsed:.0f}/s)")
+    clip = float((np.abs(data) >= CLIP_LEVEL * DAQ_RANGE_V).mean(axis=0).max()) if n else 0.0
+    return dict(n_samples=n, t_start=t_start,
+                variance=loadcell_magnitude_variance(F[:3].T) if n else 0.0,
+                mean=F.mean(axis=1) if n else np.zeros(6), clip_frac=clip)
 
 
 def main():
-    """
-    Default daq is Dev11, the default sample rate is 1000hz and the
-    default duration is 10s.
-    """
     import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--device", default="Dev11")
-    parser.add_argument("--rate", type=float, default=1000.0)
-    parser.add_argument("--duration", type=float, default=10.0)
-    args = parser.parse_args()
-
-    data, t = acquire_load(args.device, args.rate, args.duration)
-    F = calibrate_load(data, debug=True)
-
-    print("\nAverages:")
-    for label, val in zip(OUTPUT_LABELS, F.mean(axis=1)):
-        print(f"  {label}: {val: .6f}")
+    p = argparse.ArgumentParser()
+    p.add_argument("--device", default="Dev11")
+    p.add_argument("--rate", type=float, default=1000.0)
+    p.add_argument("--duration", type=float, default=10.0)
+    a = p.parse_args()
+    data, _ = acquire_load(a.device, a.rate, a.duration)
+    F = calibrate_load(data)
+    for label, v in zip(OUTPUT_LABELS, F.mean(axis=1)):
+        print(f"  {label}: {v: .6f}")
 
 
 if __name__ == "__main__":

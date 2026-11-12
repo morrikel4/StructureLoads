@@ -64,9 +64,8 @@ if str(_ACQUIRE_DIR) not in sys.path:
     sys.path.insert(0, str(_ACQUIRE_DIR))
 
 _T_START_RE = re.compile(r"t_start_perf_counter=([0-9.eE+\-]+)")
-_MG_PER_LSB_RE = re.compile(r"([0-9.]+)\s*mg/LSB")
 _ENCODER_ABS_RE = re.compile(r"start_time_perf_counter=([0-9.eE+\-]+)")
-_ANGLE_FILENAME_RE = re.compile(r"angle_([+\-]?\d+\.\d+)deg\.csv$")
+_ANGLE_FILENAME_RE = re.compile(r"angle_([+\-]?\d+\.\d+)deg_load\.csv$")
 
 
 def _read_header_t_start(path):
@@ -76,67 +75,6 @@ def _read_header_t_start(path):
         first_line = f.readline()
     m = _T_START_RE.search(first_line)
     return float(m.group(1)) if m else None
-
-
-def _read_header_mg_per_lsb(path):
-    """Reads the sensitivity from the '# LIS2DS12 <fs> mode, <x> mg/LSB, ...'
-    comment line (it depends on the accelerometer full-scale range the capture
-    was taken in). Returns None if absent (very old files)."""
-    with open(path) as f:
-        first_line = f.readline()
-    m = _MG_PER_LSB_RE.search(first_line)
-    return float(m.group(1)) if m else None
-
-
-def _reconstruct_batch_times(df, time_col="time"):
-    """Replaces a "time" column where every row in a FIFO batch shares
-    the same value (the perf_counter() reading when that whole batch
-    was read off the PCB) with one timestamp per row: within each
-    batch, the n samples are assumed evenly spaced across
-    (previous_batch_time, this_batch_time], in their existing order --
-    i.e. the last sample in a batch lands exactly at this_batch_time
-    (when it was actually read), and earlier samples in the same batch
-    are spaced back from there. The very first batch is spaced from 0.
-    Batches are identified as runs of consecutive rows with an
-    identical time value, which holds as long as the CSV is in
-    acquisition order (true for every writer in this pipeline)."""
-    times = df[time_col].to_numpy(dtype=float)
-    n = len(times)
-    new_times = np.empty(n, dtype=float)
-
-    prev_t = 0.0
-    i = 0
-    while i < n:
-        j = i
-        while j < n and times[j] == times[i]:
-            j += 1
-        batch_len = j - i
-        cur_t = times[i]
-        step = (cur_t - prev_t) / batch_len
-        new_times[i:j] = prev_t + step * np.arange(1, batch_len + 1)
-        prev_t = cur_t
-        i = j
-
-    df = df.copy()
-    df[time_col] = new_times
-    return df
-
-
-def load_accel_csv(path):
-    """Returns (DataFrame, t_start_perf_counter_or_None). The "time"
-    column is reconstructed to one timestamp per row -- see
-    _reconstruct_batch_times() / the module docstring.
-
-    The accelerometer sensitivity from the CSV header is stored in
-    df.attrs["mg_per_lsb"] (absent if the header has none); use
-    variance_analysis.accel_mg_per_lsb(df) to read it with the 2g fallback."""
-    t_start = _read_header_t_start(path)
-    df = pd.read_csv(path, comment="#")
-    df = _reconstruct_batch_times(df)
-    mg_per_lsb = _read_header_mg_per_lsb(path)
-    if mg_per_lsb is not None:
-        df.attrs["mg_per_lsb"] = mg_per_lsb
-    return df, t_start
 
 
 def load_load_csv(path):
@@ -182,11 +120,8 @@ def windowed_average_angle(encoder_df, abs_start, window_start, duration_s, coun
 @dataclass
 class AngleCapture:
     requested_angle_deg: float
-    accel_path: Path
     load_path: Optional[Path]
-    accel_df: pd.DataFrame
     load_df: Optional[pd.DataFrame]
-    accel_t_start: Optional[float]
     load_t_start: Optional[float]
     avg_motor_angle_deg: Optional[float]
     motor_angle_n_samples: int
@@ -196,20 +131,16 @@ class AngleCapture:
 
 
 def _discover_angle_files(run_dir):
-    """Finds angle_*deg.csv (accel) files, pairing each with its
-    ..._load.csv sibling if present. Sorted by the angle value in the
-    filename (the requested angle, not the settled one)."""
+    """Finds angle_*deg_load.csv files in a run directory. Returns a list of
+    (requested_angle_deg, load_path) sorted by the angle in the filename
+    (the requested angle, not the settled one)."""
     run_dir = Path(run_dir)
     pairs = []
-    for accel_path in sorted(run_dir.glob("angle_*deg.csv")):
-        if "_load" in accel_path.stem:
-            continue
-        m = _ANGLE_FILENAME_RE.search(accel_path.name)
+    for load_path in run_dir.glob("angle_*deg_load.csv"):
+        m = _ANGLE_FILENAME_RE.search(load_path.name)
         if not m:
             continue
-        angle_val = float(m.group(1))
-        load_path = run_dir / accel_path.name.replace("deg.csv", "deg_load.csv")
-        pairs.append((angle_val, accel_path, load_path if load_path.exists() else None))
+        pairs.append((float(m.group(1)), load_path))
     pairs.sort(key=lambda p: p[0])
     return pairs
 
@@ -244,15 +175,14 @@ def load_run(run_dir, counts_per_deg, duration_s):
         )
 
     captures = []
-    for angle_val, accel_path, load_path in _discover_angle_files(run_dir):
-        accel_df, accel_t_start = load_accel_csv(accel_path)
+    for angle_val, load_path in _discover_angle_files(run_dir):
         load_df, load_t_start = (
             load_load_csv(load_path) if load_path is not None else (None, None)
         )
 
         if encoder_df is not None:
             avg_angle, n_samples, std_angle = windowed_average_angle(
-                encoder_df, encoder_abs_start, accel_t_start, duration_s, counts_per_deg
+                encoder_df, encoder_abs_start, duration_s, counts_per_deg
             )
         else:
             avg_angle, n_samples, std_angle = None, 0, None
@@ -271,11 +201,8 @@ def load_run(run_dir, counts_per_deg, duration_s):
 
         captures.append(AngleCapture(
             requested_angle_deg=angle_val,
-            accel_path=accel_path,
             load_path=load_path,
-            accel_df=accel_df,
             load_df=load_df,
-            accel_t_start=accel_t_start,
             load_t_start=load_t_start,
             avg_motor_angle_deg=avg_angle,
             motor_angle_n_samples=n_samples,
