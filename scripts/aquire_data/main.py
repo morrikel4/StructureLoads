@@ -36,12 +36,13 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
+
 import numpy as np
 import pandas as pd
 
 from motor import Motor
 from utils import coordinate_transforms as ct
-import scripts.aquire_data.load_cell as lc
+import load_cell as lc
 import wind_tunnel_conditions as wtc
 from utils.live_variance_plot import LivePlotter
 
@@ -72,7 +73,7 @@ BLADE_MASS_KG = None
 ANGLES_FILE = "scripts/aquire_data/test_angles.xlsx"
 #naming convention tunnel pressure _tunnel speed
 #Bulding_###psi_###fs_v#
-OUTPUT_DIR = "Data/Production_11_18_26/run_name_here"
+OUTPUT_DIR = "Data/Production_11_18_26/test2"
 
 SAMPLE_DURATION_S = 60
 SETTLE_TIME_S = 2
