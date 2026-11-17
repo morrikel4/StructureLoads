@@ -70,13 +70,15 @@ BLADE_SPAN_M = None
 BLADE_MASS_KG = None
 
 ANGLES_FILE = "scripts/aquire_data/test_angles.xlsx"
-OUTPUT_DIR = "Data/Production_10-8-26/run_name_here"
+#naming convention tunnel pressure _tunnel speed
+#Bulding_###psi_###fs_v#
+OUTPUT_DIR = "Data/Production_11_18_26/run_name_here"
 
 SAMPLE_DURATION_S = 60
 SETTLE_TIME_S = 2
 
-SWEEP_ANGLE_DEG = -30.0
-MOUNTING_ANGLE_DEG = -5.895 + 90
+SWEEP_ANGLE_DEG = 0
+MOUNTING_ANGLE_DEG = 0
 
 SETTLE_TOLERANCE_DEG = 0.1
 SETTLE_TIMEOUT_S = 30
